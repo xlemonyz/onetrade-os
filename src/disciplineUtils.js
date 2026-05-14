@@ -538,6 +538,22 @@ function getTradeTimestamp(trade, settings) {
   return zonedDateTimeToUtc(dateKey, safeTime, settings.close_timezone);
 }
 
+function getChallengeStartTimestampMs(challenge) {
+  const raw = String(challenge?.created_at || challenge?.updated_at || "").trim();
+  if (!raw) return null;
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.getTime();
+}
+
+function getTradeEventTimestampMsForChallenge(trade, settings) {
+  const importedRaw = String(trade?.importedAt || trade?.imported_at || "").trim();
+  if (!importedRaw) return null;
+  const importedStamp = new Date(importedRaw);
+  if (Number.isNaN(importedStamp.getTime())) return null;
+  return importedStamp.getTime();
+}
+
 export function getGoldTradingDay(value = new Date(), settingsInput = {}) {
   const settings = normalizeDisciplineMarketSettings(settingsInput);
   const now = value instanceof Date ? value : new Date(value);
@@ -971,6 +987,7 @@ export function evaluateDisciplineState(project, options = {}) {
   }
 
   const startDate = asDateValue(activeChallenge.start_date) || localDateValue();
+  const challengeStartMs = getChallengeStartTimestampMs(activeChallenge);
 
   const challengeTrades = disciplineTrades
     .filter((trade) => trade?.discipline_challenge_id === activeChallenge.id && isClosedDisciplineTrade(trade))
@@ -979,7 +996,13 @@ export function evaluateDisciplineState(project, options = {}) {
       outcome: normalizeClosedTradeOutcome(trade?.outcome),
       trading_day_key: getTradeTradingDayKeyForEvaluation(trade, marketSettings),
     }))
-    .filter((trade) => trade.trading_day_key && trade.trading_day_key >= startDate);
+    .filter((trade) => {
+      if (!trade.trading_day_key || trade.trading_day_key < startDate) return false;
+      if (!Number.isFinite(challengeStartMs) || challengeStartMs <= 0) return true;
+      const tradeEventMs = getTradeEventTimestampMsForChallenge(trade, marketSettings);
+      if (!Number.isFinite(tradeEventMs) || tradeEventMs <= 0) return true;
+      return tradeEventMs >= challengeStartMs;
+    });
 
   const tradesByDate = challengeTrades.reduce((acc, trade) => {
     const date = trade.trading_day_key;
@@ -1402,12 +1425,17 @@ export function closeOneTradeRuleDay(project, options = {}) {
   const allTrades = Array.isArray(evaluated?.project?.disciplineJournalTrades)
     ? evaluated.project.disciplineJournalTrades
     : [];
+  const activeChallengeStartMs = getChallengeStartTimestampMs(activeOrCurrentChallenge);
   const challengeDayTrades = allTrades.filter((trade) => {
     if (String(trade?.discipline_challenge_id || "") !== String(activeOrCurrentChallenge.id)) {
       return false;
     }
     const dayKey = getTradeTradingDayKeyForEvaluation(trade, marketSettings);
-    return dayKey === closeTradingDayKey;
+    if (dayKey !== closeTradingDayKey) return false;
+    if (!Number.isFinite(activeChallengeStartMs) || activeChallengeStartMs <= 0) return true;
+    const tradeEventMs = getTradeEventTimestampMsForChallenge(trade, marketSettings);
+    if (!Number.isFinite(tradeEventMs) || tradeEventMs <= 0) return true;
+    return tradeEventMs >= activeChallengeStartMs;
   });
 
   const normalizedDayTrades = challengeDayTrades

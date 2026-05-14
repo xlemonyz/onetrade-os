@@ -835,7 +835,7 @@ export default function AccountPage({ session = null, embedded = false, initialS
 
                 <input
                   type="text"
-                  placeholder="MT5 account number (optional)"
+                  placeholder="MT5 account number (use real login number)"
                   value={mt5AccountNumber}
                   onChange={(e) => setMt5AccountNumber(e.target.value)}
                   style={{
@@ -847,6 +847,16 @@ export default function AccountPage({ session = null, embedded = false, initialS
                     fontSize: 14,
                   }}
                 />
+                <div
+                  style={{
+                    marginTop: -2,
+                    marginBottom: 10,
+                    fontSize: 12,
+                    color: "#64748b",
+                  }}
+                >
+                  Use your exact MT5 login number. Wrong/dummy number can cause account mismatch during sync.
+                </div>
 
                 <div
                   style={{
