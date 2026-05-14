@@ -4790,6 +4790,22 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     return sanitizeOneTradeRuleForStore(evaluated.project);
   }
 
+  function snapshotOneTradeRule(ruleState) {
+    try {
+      const cleaned = sanitizeOneTradeRuleForStore(ruleState || emptyOneTradeRule(""));
+      return JSON.stringify(cleaned);
+    } catch {
+      return "{}";
+    }
+  }
+
+  function createCloudSyncSnapshot(projectList = projects, ruleState = oneTradeRule) {
+    return JSON.stringify({
+      projects: snapshotProjects(projectList || []),
+      oneTradeRule: snapshotOneTradeRule(ruleState),
+    });
+  }
+
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -4846,7 +4862,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       return;
     }
 
-    const currentSnapshot = snapshotProjects(projects);
+    const currentSnapshot = createCloudSyncSnapshot(projects, oneTradeRule);
     if (currentSnapshot === lastCloudSnapshotRef.current) return;
 
     if (autoSaveTimerRef.current) {
@@ -4862,7 +4878,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
         clearTimeout(autoSaveTimerRef.current);
       }
     };
-  }, [projects, loaded, supabaseSession]);
+  }, [projects, oneTradeRule, loaded, supabaseSession]);
 
   useEffect(() => {
     if (!selectedProjectId && projects.length > 0) {
@@ -5453,6 +5469,11 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       .from("trades")
       .select("id,project_id,data,created_at,updated_at")
       .order("created_at", { ascending: false });
+    const { data: oneTradeRuleRow, error: oneTradeRuleError } = await supabase
+      .from("one_trade_rule_states")
+      .select("state")
+      .eq("user_id", session.user.id)
+      .maybeSingle();
 
     setCloudBusy(false);
 
@@ -5463,20 +5484,38 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       return false;
     }
 
+    if (oneTradeRuleError) {
+      const errorText = String(oneTradeRuleError.message || "").toLowerCase();
+      if (errorText.includes("does not exist") || errorText.includes("relation")) {
+        setCloudStatus(
+          "Cloud projects loaded. One Trade Rule cloud state table missing. Run supabase_one_trade_rule_state_setup.sql once."
+        );
+      } else {
+        setCloudStatus(`Cloud projects loaded. One Trade Rule state load warning: ${oneTradeRuleError.message}`);
+      }
+    }
+
     const cloudProjects = buildProjectsFromCloud(projectRows || [], tradeRows || []).map(
       applyDisciplineToProject
     );
+    const loadedOneTradeRule = normalizeOneTradeRule(
+      oneTradeRuleRow?.state && typeof oneTradeRuleRow.state === "object" ? oneTradeRuleRow.state : null,
+      session.user.id
+    );
     skipNextAutoSaveRef.current = true;
-    lastCloudSnapshotRef.current = snapshotProjects(cloudProjects);
+    lastCloudSnapshotRef.current = createCloudSyncSnapshot(cloudProjects, loadedOneTradeRule);
     cloudInitialLoadDoneRef.current = true;
 
     setProjects(cloudProjects);
+    setOneTradeRule(loadedOneTradeRule);
     setSelectedProjectId(cloudProjects[0]?.id || "");
     setSelectedTradeId("");
     setSearch("");
     setFilterDir("ALL");
     setView("projects");
-    setCloudStatus(`Loaded ${cloudProjects.length} project(s) from Supabase.`);
+    if (!oneTradeRuleError) {
+      setCloudStatus(`Loaded ${cloudProjects.length} project(s) and One Trade Rule state from Supabase.`);
+    }
     return true;
   }
 
@@ -5498,7 +5537,8 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     const userId = session.user.id;
     const normalizedProjects = projects.map(normalizeProject);
     const tradeCount = normalizedProjects.reduce((sum, project) => sum + project.trades.length, 0);
-    const nextSnapshot = snapshotProjects(normalizedProjects);
+    const sanitizedOneTradeRule = sanitizeOneTradeRuleForStore(oneTradeRule);
+    const nextSnapshot = createCloudSyncSnapshot(normalizedProjects, sanitizedOneTradeRule);
 
     isPushingCloudRef.current = true;
     setCloudBusy(true);
@@ -5523,6 +5563,29 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     }
 
     if (normalizedProjects.length === 0) {
+      const { error: oneTradeStateUpsertErrorWhenEmpty } = await supabase
+        .from("one_trade_rule_states")
+        .upsert(
+          {
+            user_id: userId,
+            state: sanitizedOneTradeRule,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "user_id" }
+        );
+      if (oneTradeStateUpsertErrorWhenEmpty) {
+        const errorText = String(oneTradeStateUpsertErrorWhenEmpty.message || "").toLowerCase();
+        isPushingCloudRef.current = false;
+        setCloudBusy(false);
+        setCloudStatus("");
+        if (errorText.includes("does not exist") || errorText.includes("relation")) {
+          alert("One Trade Rule cloud state table missing. Run supabase_one_trade_rule_state_setup.sql once.");
+        } else {
+          alert(oneTradeStateUpsertErrorWhenEmpty.message);
+        }
+        return false;
+      }
+
       lastCloudSnapshotRef.current = nextSnapshot;
       cloudInitialLoadDoneRef.current = true;
       isPushingCloudRef.current = false;
@@ -6078,6 +6141,29 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       if (summaryResult?.advancedToNextDay) {
         await loadActiveCleanDayChallenge({ silent: true });
       }
+    }
+
+    const { error: oneTradeStateUpsertError } = await supabase
+      .from("one_trade_rule_states")
+      .upsert(
+        {
+          user_id: userId,
+          state: sanitizedOneTradeRule,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id" }
+      );
+    if (oneTradeStateUpsertError) {
+      const errorText = String(oneTradeStateUpsertError.message || "").toLowerCase();
+      isPushingCloudRef.current = false;
+      setCloudBusy(false);
+      setCloudStatus("");
+      if (errorText.includes("does not exist") || errorText.includes("relation")) {
+        alert("One Trade Rule cloud state table missing. Run supabase_one_trade_rule_state_setup.sql once.");
+      } else {
+        alert(oneTradeStateUpsertError.message);
+      }
+      return false;
     }
     setCleanDayFooterEvent({
       type: "saved",
