@@ -2030,20 +2030,24 @@ function resolveMt5TradeDayKey(trade, marketSettings, currentGoldDayKey = "", fa
   const explicitKey = String(trade?.trading_day_key || trade?.tradingDayKey || "").slice(0, 10);
   if (explicitKey) return explicitKey;
 
+  const importedAtRaw = String(trade?.importedAt || trade?.imported_at || "").trim();
+  if (importedAtRaw) {
+    const importedAtDate = new Date(importedAtRaw);
+    if (!Number.isNaN(importedAtDate.getTime())) {
+      const importedTradingDayKey = String(
+        getCountdownToGoldClose(importedAtDate, marketSettings)?.tradingDayKey || ""
+      ).slice(0, 10);
+      if (importedTradingDayKey) return importedTradingDayKey;
+      const importedDateKey = localDateValue(importedAtDate);
+      if (importedDateKey) return importedDateKey;
+    }
+  }
+
   const computedKey = String(getTradeTradingDayKey(trade, marketSettings) || "").slice(0, 10);
   if (computedKey) return computedKey;
 
   const rawDateKey = String(trade?.date || "").slice(0, 10);
   if (rawDateKey) return rawDateKey;
-
-  const importedAtRaw = String(trade?.importedAt || trade?.imported_at || "").trim();
-  if (importedAtRaw) {
-    const importedAtDate = new Date(importedAtRaw);
-    if (!Number.isNaN(importedAtDate.getTime())) {
-      const importedDateKey = localDateValue(importedAtDate);
-      if (importedDateKey) return importedDateKey;
-    }
-  }
 
   return currentGoldDayKey || fallbackLocalDate || "";
 }
@@ -2055,20 +2059,7 @@ function resolveTradeEventMs(trade) {
     if (!Number.isNaN(importedAt.getTime())) return importedAt.getTime();
   }
 
-  const dateKey = String(trade?.date || "").slice(0, 10);
-  if (!dateKey) return null;
-  const rawTime = String(trade?.time || "12:00").trim();
-  const timeMatch = rawTime.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
-  const hour = timeMatch ? Math.max(0, Math.min(23, Number(timeMatch[1]))) : 12;
-  const minute = timeMatch ? Math.max(0, Math.min(59, Number(timeMatch[2]))) : 0;
-  const second = timeMatch ? Math.max(0, Math.min(59, Number(timeMatch[3] || 0))) : 0;
-  const localStamp = new Date(
-    `${dateKey}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:${String(
-      second
-    ).padStart(2, "0")}`
-  );
-  if (Number.isNaN(localStamp.getTime())) return null;
-  return localStamp.getTime();
+  return null;
 }
 
 function getOneTradeDuplicateKey(trade) {
@@ -4688,7 +4679,23 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       normalizedStored.map((trade) => getOneTradeDuplicateKey(trade)).filter(Boolean)
     );
     const activeChallenge = getActiveDisciplineChallenge(sourceRule);
-    if (!activeChallenge) {
+    const allChallenges = Array.isArray(sourceRule?.disciplineChallenges)
+      ? sourceRule.disciplineChallenges
+      : [];
+    const fallbackCurrentChallenge =
+      [...allChallenges]
+        .filter(
+          (challenge) =>
+            challenge?.status === DISCIPLINE_CHALLENGE_STATUS.BROKEN_FROZEN ||
+            challenge?.status === DISCIPLINE_CHALLENGE_STATUS.SCHEDULED
+        )
+        .sort((a, b) => String(b?.updated_at || "").localeCompare(String(a?.updated_at || "")))[0] ||
+      [...allChallenges]
+        .filter((challenge) => challenge?.status !== DISCIPLINE_CHALLENGE_STATUS.ARCHIVED)
+        .sort((a, b) => String(b?.updated_at || "").localeCompare(String(a?.updated_at || "")))[0] ||
+      null;
+    const challengeForBridge = activeChallenge || fallbackCurrentChallenge;
+    if (!challengeForBridge) {
       return normalizedStored;
     }
 
@@ -4702,7 +4709,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       if (!isMt5ImportedTrade(projectTrade)) return;
       const normalized = normalizeTrade(projectTrade);
       const challengeStartMs = new Date(
-        activeChallenge?.created_at || activeChallenge?.updated_at || ""
+        challengeForBridge?.created_at || challengeForBridge?.updated_at || ""
       ).getTime();
       const tradeEventMs = resolveTradeEventMs(normalized);
       if (
@@ -4724,7 +4731,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       const tradeDateKey = String(normalized?.date || "").slice(0, 10);
       const tradingDayKey = rawTradeDayKey || tradeDateKey || currentGoldDayKey;
       if (!tradingDayKey) return;
-      const challengeStartDate = String(activeChallenge?.start_date || "").slice(0, 10);
+      const challengeStartDate = String(challengeForBridge?.start_date || "").slice(0, 10);
       if (challengeStartDate && tradingDayKey < challengeStartDate) return;
 
       const readinessStateAtTrade = resolveTradeReadinessStateAtTrade(normalized);
@@ -4734,7 +4741,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
         outcome: normalizedOutcome,
         trading_day_key: tradingDayKey,
         discipline_journal_name: normalized?.discipline_journal_name || "Trades Journal",
-        discipline_challenge_id: String(activeChallenge.id),
+        discipline_challenge_id: String(challengeForBridge.id),
         readinessStateAtTrade,
         readinessBreach:
           Boolean(normalized?.readinessBreach ?? normalized?.readiness_breach) ||
@@ -5078,6 +5085,14 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       })
       .sort((a, b) => `${b.date}${b.time}`.localeCompare(`${a.date}${a.time}`));
   }, [selectedProject, filterDir, search]);
+  const selectedProjectTradeNumberById = useMemo(() => {
+    if (!selectedProject) return {};
+    return Object.fromEntries(
+      [...selectedProject.trades]
+        .sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`))
+        .map((trade, index) => [trade.id, index + 1])
+    );
+  }, [selectedProject]);
 
   const readinessPreview = useMemo(() => evaluateReadiness(readinessForm), [readinessForm]);
   const readinessBadge = todayReadiness
@@ -5152,9 +5167,14 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     () => getCountdownToGoldClose(nowDate, focusMarketSettings),
     [disciplineNowMs, focusMarketSettings]
   );
+  const focusActiveTradingDayKey = String(
+    focusDisciplineEvaluation?.todayTradingDayKey ||
+      focusCloseCountdown?.tradingDayKey ||
+      localDateValue(nowDate)
+  ).slice(0, 10);
   useEffect(() => {
     const activeChallenge = focusDisciplineEvaluation?.activeChallenge || null;
-    const currentTradingDayKey = String(focusCloseCountdown?.tradingDayKey || "").slice(0, 10);
+    const currentTradingDayKey = focusActiveTradingDayKey;
     if (!activeChallenge?.id || !currentTradingDayKey) return;
 
     const previousObservedTradingDayKey = lastAutoCloseRolloverKeyRef.current;
@@ -5168,7 +5188,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     const previousGoldDayKey = shiftDateKeyByDays(currentTradingDayKey, -1);
     if (!previousGoldDayKey) return;
     runOneTradeAutoCloseForDay(previousGoldDayKey);
-  }, [focusCloseCountdown?.tradingDayKey, focusDisciplineEvaluation?.activeChallenge?.id]);
+  }, [focusActiveTradingDayKey, focusDisciplineEvaluation?.activeChallenge?.id]);
   const focusDisciplineChecklist = useMemo(
     () =>
       focusCurrentDisciplineChallenge
@@ -5180,8 +5200,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     [focusCurrentDisciplineChallenge, focusDisciplineEvaluation]
   );
   const focusYesterdaySummary = useMemo(() => {
-    const currentTradingDayKey =
-      String(focusCloseCountdown?.tradingDayKey || localDateValue(nowDate)).slice(0, 10);
+    const currentTradingDayKey = focusActiveTradingDayKey;
     if (!focusCurrentDisciplineChallenge) {
       return {
         heading: "Yesterday",
@@ -5254,16 +5273,49 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       title: `${dateLabel} — Needs Review`,
       description: "Check yesterday calmly when you are ready.",
     };
-  }, [focusCloseCountdown?.tradingDayKey, focusCurrentDisciplineChallenge, focusDisciplineEvaluation, nowDate]);
+  }, [focusActiveTradingDayKey, focusCurrentDisciplineChallenge, focusDisciplineEvaluation, nowDate]);
   const focusRuleJournalTrades = useMemo(() => {
     const all = Array.isArray(focusDisciplineEvaluation?.project?.disciplineJournalTrades)
       ? focusDisciplineEvaluation.project.disciplineJournalTrades
       : [];
+    const activeDayKey = focusActiveTradingDayKey;
+    const challengeStartMs = (() => {
+      if (!focusCurrentDisciplineChallenge) return null;
+      const raw = String(
+        focusCurrentDisciplineChallenge?.created_at || focusCurrentDisciplineChallenge?.updated_at || ""
+      ).trim();
+      if (!raw) return null;
+      const parsed = new Date(raw);
+      return Number.isNaN(parsed.getTime()) ? null : parsed.getTime();
+    })();
     const filtered = focusCurrentDisciplineChallenge
-      ? all.filter((trade) => trade?.discipline_challenge_id === focusCurrentDisciplineChallenge.id)
-      : all.filter((trade) => Boolean(trade?.one_trade_manual));
+          ? all.filter((trade) => {
+              if (trade?.discipline_challenge_id !== focusCurrentDisciplineChallenge.id) return false;
+          const tradeDayKey = String(
+            trade?.trading_day_key ||
+              trade?.tradingDayKey ||
+              getTradeTradingDayKey(trade, focusMarketSettings) ||
+              trade?.date ||
+              ""
+          ).slice(0, 10);
+          if (!tradeDayKey || tradeDayKey !== activeDayKey) return false;
+          if (!Number.isFinite(challengeStartMs) || challengeStartMs <= 0) return true;
+          const tradeEventMs = resolveTradeEventMs(trade);
+          if (!Number.isFinite(tradeEventMs) || tradeEventMs <= 0) return true;
+          return tradeEventMs >= challengeStartMs;
+        })
+      : all.filter((trade) => {
+          const tradeDayKey = String(
+            trade?.trading_day_key ||
+              trade?.tradingDayKey ||
+              getTradeTradingDayKey(trade, focusMarketSettings) ||
+              trade?.date ||
+              ""
+          ).slice(0, 10);
+          return Boolean(trade?.one_trade_manual) && tradeDayKey === activeDayKey;
+        });
     return filtered.sort(compareTradesChronoDesc);
-  }, [focusCurrentDisciplineChallenge, focusDisciplineEvaluation]);
+  }, [focusActiveTradingDayKey, focusCurrentDisciplineChallenge, focusDisciplineEvaluation, nowDate, focusMarketSettings]);
   const focusHasImportedReadinessBreachTrade = useMemo(
     () =>
       focusRuleJournalTrades.some(
@@ -5519,7 +5571,12 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     return true;
   }
 
-  async function pushCloudJournal({ silent = false, sessionOverride = null } = {}) {
+  async function pushCloudJournal({
+    silent = false,
+    sessionOverride = null,
+    projectsOverride = null,
+    oneTradeRuleOverride = null,
+  } = {}) {
     if (!requireCloudConfig()) return false;
 
     const session = sessionOverride || cloudSessionRef.current || supabaseSession;
@@ -5535,9 +5592,14 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     }
 
     const userId = session.user.id;
-    const normalizedProjects = projects.map(normalizeProject);
+    const sourceProjects = Array.isArray(projectsOverride) ? projectsOverride : projects;
+    const sourceOneTradeRule =
+      oneTradeRuleOverride && typeof oneTradeRuleOverride === "object"
+        ? oneTradeRuleOverride
+        : oneTradeRule;
+    const normalizedProjects = sourceProjects.map(normalizeProject);
     const tradeCount = normalizedProjects.reduce((sum, project) => sum + project.trades.length, 0);
-    const sanitizedOneTradeRule = sanitizeOneTradeRuleForStore(oneTradeRule);
+    const sanitizedOneTradeRule = sanitizeOneTradeRuleForStore(sourceOneTradeRule);
     const nextSnapshot = createCloudSyncSnapshot(normalizedProjects, sanitizedOneTradeRule);
 
     isPushingCloudRef.current = true;
@@ -5655,6 +5717,28 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       setTimeout(() => pushCloudJournal({ silent: true }), 250);
     }
 
+    return true;
+  }
+
+  async function persistOneTradeRuleStateNow(nextRuleState) {
+    if (!isSupabaseConfigured || !supabase || !supabaseSession?.user?.id) return true;
+    const { error } = await supabase.from("one_trade_rule_states").upsert(
+      {
+        user_id: supabaseSession.user.id,
+        state: sanitizeOneTradeRuleForStore(nextRuleState),
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "user_id" }
+    );
+    if (error) {
+      const errorText = String(error.message || "").toLowerCase();
+      if (errorText.includes("does not exist") || errorText.includes("relation")) {
+        setCloudStatus("State saved locally. Cloud state table missing. Run supabase_one_trade_rule_state_setup.sql once.");
+      } else {
+        setCloudStatus(`State saved locally. Cloud write warning: ${error.message}`);
+      }
+      return false;
+    }
     return true;
   }
 
@@ -6314,6 +6398,12 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     setView("project");
   };
 
+  const isHiddenMt5ProjectCard = (project) => {
+    const name = String(project?.name || "").trim().toLowerCase();
+    const id = String(project?.id || "").trim().toLowerCase();
+    return name === "mt5 auto sync" || id.startsWith("project-mt5-");
+  };
+
   const closeSidebarDrawer = () => {
     setSidebarDrawerOpen(false);
   };
@@ -6342,6 +6432,30 @@ export default function GoldJournal({ session: supabaseSession = null }) {
   const openOneTradeRuleFromSidebar = () => {
     setSidebarActiveItem("one-trade-rule");
     scrollToDashboardSection(oneTradeSectionRef);
+  };
+
+  const openTradingJournalFromSidebar = () => {
+    const selectedNow = projects.find((project) => project.id === selectedProjectId) || null;
+    if (!selectedNow || isHiddenMt5ProjectCard(selectedNow)) {
+      const visibleProjects = projects.filter((project) => !isHiddenMt5ProjectCard(project));
+      const preferredProject =
+        visibleProjects.find((project) => Array.isArray(project?.trades) && project.trades.length > 0) ||
+        visibleProjects[0];
+      if (preferredProject?.id) {
+        setSelectedProjectId(preferredProject.id);
+      }
+    }
+    setSearch("");
+    setFilterDir("ALL");
+    setSelectedTradeId("");
+    setSidebarActiveItem("trading-journal");
+    setView("trading-journal-page");
+    setSidebarDrawerOpen(false);
+    if (typeof window !== "undefined") {
+      window.requestAnimationFrame(() => {
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      });
+    }
   };
 
   const openMindsetCheckFromSidebar = () => {
@@ -6374,17 +6488,17 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     openAccountPage("integrations-mt5");
   };
 
-  const startDisciplineChallengeForUser = (targetCleanDays, challengeName) => {
+  const startDisciplineChallengeForUser = async (targetCleanDays, challengeName) => {
     const safeName = String(challengeName || "").trim();
-    setOneTradeRule((prev) =>
-      applyOneTradeRule(
-        startDisciplineChallenge(prev, {
-          targetCleanDays,
-          challengeName: safeName,
-        }),
-        nowDate
-      )
+    const startedRuleState = applyOneTradeRule(
+      startDisciplineChallenge(oneTradeRule, {
+        targetCleanDays,
+        challengeName: safeName,
+      }),
+      nowDate
     );
+    setOneTradeRule(startedRuleState);
+    await persistOneTradeRuleStateNow(startedRuleState);
     setCloudStatus(
       `${safeName || `${targetCleanDays} Trade Discipline Challenge`} started.`
     );
@@ -6395,9 +6509,9 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     setDisciplineStartModalOpen(true);
   };
 
-  const startSelectedDisciplineChallenge = () => {
+  const startSelectedDisciplineChallenge = async () => {
     const safeName = `${disciplineStartTarget} Clean Days Challenge`;
-    startDisciplineChallengeForUser(disciplineStartTarget, safeName);
+    await startDisciplineChallengeForUser(disciplineStartTarget, safeName);
     setDisciplineStartModalOpen(false);
   };
 
@@ -6630,8 +6744,12 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     });
     if (!approved) return;
 
-    setOneTradeRule((prev) => applyOneTradeRule(exitDisciplineChallenge(prev), nowDate));
-    setCloudStatus("Discipline challenge exited.");
+    const exitedRuleState = applyOneTradeRule(exitDisciplineChallenge(oneTradeRule), nowDate);
+    setOneTradeRule(exitedRuleState);
+
+    // Hard-persist only One Trade Rule state immediately to prevent stale challenge reappearing after refresh.
+    const persisted = await persistOneTradeRuleStateNow(exitedRuleState);
+    if (persisted) setCloudStatus("Discipline challenge exited.");
   };
 
   const deleteArchivedChallengeForUser = async (challengeId) => {
@@ -8688,6 +8806,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
   const isMindsetCheckPage = view === "mindset-check-page";
   const isCleanDayPage = view === "clean-day-page";
   const isSettingsPage = view === "settings-page";
+  const isTradingJournalPage = view === "trading-journal-page";
   const cleanDayCompareFields = [
     "eveningLocation",
     "eveningWentCarromPlace",
@@ -10306,6 +10425,15 @@ export default function GoldJournal({ session: supabaseSession = null }) {
             </button>
             <button
               type="button"
+              className={`app-sidebar-link${sidebarActiveItem === "trading-journal" ? " active" : ""}`}
+              onClick={openTradingJournalFromSidebar}
+              title={sidebarCollapsed ? "Trading Journal" : ""}
+            >
+              <ListChecks className="app-sidebar-link-icon" strokeWidth={2.1} />
+              <span className="app-sidebar-link-label">Trading Journal</span>
+            </button>
+            <button
+              type="button"
               className={`app-sidebar-link${sidebarActiveItem === "mindset-check" ? " active" : ""}`}
               onClick={openMindsetCheckFromSidebar}
               title={sidebarCollapsed ? "Mindset Check" : ""}
@@ -10431,7 +10559,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
             <div style={{ width: 46 }} />
           </div>
           <div className="home-shell">
-          <div className={`home-two-col${isMindsetCheckPage || isCleanDayPage || isSettingsPage ? " mindset-full" : ""}`}>
+          <div className={`home-two-col${isMindsetCheckPage || isCleanDayPage || isSettingsPage || isTradingJournalPage ? " mindset-full" : ""}`}>
           {isMindsetCheckPage ? (
             <div>
               <MindsetReadinessPage
@@ -10486,7 +10614,133 @@ export default function GoldJournal({ session: supabaseSession = null }) {
               />
             </div>
           ) : null}
-          <div style={{ display: isMindsetCheckPage || isCleanDayPage || isSettingsPage ? "none" : "block" }}>
+          {isTradingJournalPage ? (
+            <div className="mindset-main-pane" style={{ width: "100%", maxWidth: APP_PAGE_WIDTH }}>
+              {selectedProject ? (
+                <Section num="3" title="Trading Journal" color={G.purple}>
+                  {selectedProject.trades.length > 0 && (
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
+                        gap: 12,
+                        marginBottom: 20,
+                      }}
+                    >
+                      <MetricCard label="Trades" value={selectedProject.trades.length} color={G.gold} />
+                      <MetricCard label="TP Hit" value={selectedProject.trades.filter((trade) => trade.outcome === "TP").length} color={G.win} />
+                      <MetricCard label="SL Hit" value={selectedProject.trades.filter((trade) => trade.outcome === "SL").length} color={G.loss} />
+                      <MetricCard
+                        label="Total PnL"
+                        value={fmtMoney(selectedProject.trades.reduce((sum, trade) => sum + (Number(trade.pnl) || 0), 0), true)}
+                        color={selectedProject.trades.reduce((sum, trade) => sum + (Number(trade.pnl) || 0), 0) >= 0 ? G.win : G.loss}
+                      />
+                      <MetricCard
+                        label="Avg Rating"
+                        value={
+                          (() => {
+                            const ratedTrades = selectedProject.trades.filter((trade) => Number(trade.rating));
+                            if (!ratedTrades.length) return "--";
+                            const avg = ratedTrades.reduce((sum, trade) => sum + Number(trade.rating || 0), 0) / ratedTrades.length;
+                            return `${avg.toFixed(1)}/5`;
+                          })()
+                        }
+                        color={G.gold}
+                      />
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", gap: 10, marginBottom: 20, alignItems: "center", flexWrap: "wrap" }}>
+                    <FInput
+                      placeholder="Search pair, setup, plan..."
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                      style={{ maxWidth: 280 }}
+                    />
+                    {["ALL", "BUY", "SELL"].map((direction) => (
+                      <button
+                        key={direction}
+                        type="button"
+                        onClick={() => setFilterDir(direction)}
+                        style={{
+                          padding: "8px 16px",
+                          borderRadius: 8,
+                          cursor: "pointer",
+                          fontSize: 12,
+                          fontWeight: 600,
+                          transition: "all 0.15s",
+                          background: filterDir === direction ? G.goldGlow2 : "transparent",
+                          border: `1px solid ${filterDir === direction ? G.gold : G.border}`,
+                          color: filterDir === direction ? G.goldLight : G.textMuted,
+                        }}
+                      >
+                        {direction}
+                      </button>
+                    ))}
+                    <div style={{ marginLeft: "auto", fontSize: 13, color: G.textMuted }}>
+                      {filteredTrades.length} trade{filteredTrades.length !== 1 ? "s" : ""}
+                    </div>
+                  </div>
+
+                  {filteredTrades.length === 0 ? (
+                    <div style={{ textAlign: "center", padding: "72px 20px", color: G.textMuted }}>
+                      <div style={{ fontFamily: "'Cormorant Garamond', serif", fontSize: 24, color: G.text, marginBottom: 10 }}>
+                        {selectedProject.trades.length === 0 ? "No trades yet" : "No results"}
+                      </div>
+                      <div style={{ fontSize: 14, marginBottom: 26 }}>
+                        {selectedProject.trades.length === 0
+                          ? "Start logging trades inside this project."
+                          : "Change the search text or direction filter."}
+                      </div>
+                      {selectedProject.trades.length === 0 && (
+                        <button
+                          type="button"
+                          onClick={openTradeNew}
+                          style={{
+                            background: `linear-gradient(135deg, ${G.gold}, ${G.goldDim})`,
+                            border: "none",
+                            color: "#ffffff",
+                            padding: "12px 28px",
+                            borderRadius: 10,
+                            cursor: "pointer",
+                            fontSize: 14,
+                            fontWeight: 800,
+                          }}
+                        >
+                          Log First Trade
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                      {filteredTrades.map((trade) => (
+                        <TradeCard
+                          key={trade.id}
+                          trade={trade}
+                          tradeNo={selectedProjectTradeNumberById[trade.id]}
+                          onClick={() => openTradeView(trade.id)}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </Section>
+              ) : (
+                <div
+                  style={{
+                    background: usePremiumOneTradeTheme ? "#FFFFFF" : G.bgCard,
+                    border: usePremiumOneTradeTheme ? "1px solid #DDE7F2" : `1px solid ${G.border}`,
+                    borderRadius: 16,
+                    padding: "18px 20px",
+                    color: G.textMuted,
+                    fontSize: 14,
+                  }}
+                >
+                  No project selected yet. Open a project with trades, then come back to Trading Journal.
+                </div>
+              )}
+            </div>
+          ) : null}
+          <div style={{ display: isMindsetCheckPage || isCleanDayPage || isSettingsPage || isTradingJournalPage ? "none" : "block" }}>
             <div className="home-projects-grid">
                 <div
                   className="one-trade-main-card"
@@ -11841,8 +12095,8 @@ export default function GoldJournal({ session: supabaseSession = null }) {
                   </>
                 </div>
                 <div ref={projectsSectionRef} style={{ gridColumn: "1 / -1", height: 0 }} />
-                {projects.length > 0
-                  ? projects.map((project) => (
+                {!isTradingJournalPage && projects.length > 0
+                  ? projects.filter((project) => !isHiddenMt5ProjectCard(project)).map((project) => (
                       <ProjectCard
                         key={project.id}
                         project={project}
@@ -11858,7 +12112,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
           <div
             className="home-right-sticky"
             ref={mindsetSectionRef}
-            style={{ display: isCleanDayPage || isSettingsPage ? "none" : "block" }}
+            style={{ display: isCleanDayPage || isSettingsPage || isTradingJournalPage ? "none" : "block" }}
           >
             <MindsetReadinessPage
               isMindsetCheckPage={false}
