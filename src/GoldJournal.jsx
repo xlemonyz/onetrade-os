@@ -81,6 +81,7 @@ import {
   getActiveDisciplineChallenge,
   getCountdownToGoldClose,
   getChallengeChecklist,
+  getTradeEventTimestampMsForChallenge,
   getTradeTradingDayKey,
   normalizeDisciplineMarketSettings,
   startDisciplineChallenge,
@@ -2027,6 +2028,9 @@ function normalizeOneTradeOutcome(outcome) {
 }
 
 function resolveMt5TradeDayKey(trade, marketSettings, currentGoldDayKey = "", fallbackLocalDate = "") {
+  const computedKey = String(getTradeTradingDayKey(trade, marketSettings) || "").slice(0, 10);
+  if (computedKey) return computedKey;
+
   const explicitKey = String(trade?.trading_day_key || trade?.tradingDayKey || "").slice(0, 10);
   if (explicitKey) return explicitKey;
 
@@ -2043,23 +2047,28 @@ function resolveMt5TradeDayKey(trade, marketSettings, currentGoldDayKey = "", fa
     }
   }
 
-  const computedKey = String(getTradeTradingDayKey(trade, marketSettings) || "").slice(0, 10);
-  if (computedKey) return computedKey;
-
   const rawDateKey = String(trade?.date || "").slice(0, 10);
   if (rawDateKey) return rawDateKey;
 
   return currentGoldDayKey || fallbackLocalDate || "";
 }
 
-function resolveTradeEventMs(trade) {
-  const importedAtRaw = String(trade?.importedAt || trade?.imported_at || "").trim();
-  if (importedAtRaw) {
-    const importedAt = new Date(importedAtRaw);
-    if (!Number.isNaN(importedAt.getTime())) return importedAt.getTime();
-  }
+function resolveTradeEventMs(trade, marketSettings) {
+  const eventMs = getTradeEventTimestampMsForChallenge(trade, marketSettings);
+  return Number.isFinite(eventMs) && eventMs > 0 ? eventMs : null;
+}
 
-  return null;
+function getOneTradeViewDayKey(trade, marketSettings, currentGoldDayKey = "", fallbackLocalDate = "") {
+  if (isMt5ImportedTrade(trade)) {
+    return resolveMt5TradeDayKey(trade, marketSettings, currentGoldDayKey, fallbackLocalDate);
+  }
+  return String(
+    trade?.trading_day_key ||
+      trade?.tradingDayKey ||
+      getTradeTradingDayKey(trade, marketSettings) ||
+      trade?.date ||
+      ""
+  ).slice(0, 10);
 }
 
 function getOneTradeDuplicateKey(trade) {
@@ -4537,6 +4546,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
   const [expandedArchiveChallengeId, setExpandedArchiveChallengeId] = useState("");
   const [showBrokenOnlyTrades, setShowBrokenOnlyTrades] = useState(false);
   const [focusTradeSortMode, setFocusTradeSortMode] = useState("newest");
+  const [focusSelectedDayKey, setFocusSelectedDayKey] = useState("");
   const [archiveShowBrokenOnlyTrades, setArchiveShowBrokenOnlyTrades] = useState(false);
   const [archiveTradeSortMode, setArchiveTradeSortMode] = useState("newest");
   const [pendingReadinessEntryMeta, setPendingReadinessEntryMeta] = useState(null);
@@ -4648,8 +4658,12 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     const todayGateState = getOneTradeReadinessState(todayReadiness);
     const normalizedStored = stored.map((trade) => {
       const fallbackState = resolveTradeReadinessStateAtTrade(trade);
-      const tradeDayKey =
-        String(trade?.trading_day_key || trade?.tradingDayKey || trade?.date || "").slice(0, 10);
+      const tradeDayKey = getOneTradeViewDayKey(
+        trade,
+        oneTradeMarketSettings,
+        currentGoldDayKey,
+        todayLocalDate
+      );
       const forceTodayBreach =
         todayGateState === ONE_TRADE_READINESS_STATE.DO_NOT_TRADE &&
         Boolean(currentGoldDayKey) &&
@@ -4698,6 +4712,16 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     if (!challengeForBridge) {
       return normalizedStored;
     }
+    const blockedTicketsBeforeStart = new Set(
+      (Array.isArray(challengeForBridge?.blocked_mt5_tickets_before_start)
+        ? challengeForBridge.blocked_mt5_tickets_before_start
+        : []
+      )
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+    );
+    const importCutoffRaw = String(challengeForBridge?.trade_import_cutoff_at || "").trim();
+    const importCutoffMs = importCutoffRaw ? new Date(importCutoffRaw).getTime() : null;
 
     const bridgedImportedTrades = [];
     const projectTrades = Array.isArray(projects)
@@ -4708,16 +4732,29 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     projectTrades.forEach((projectTrade) => {
       if (!isMt5ImportedTrade(projectTrade)) return;
       const normalized = normalizeTrade(projectTrade);
+      const normalizedTicket = String(
+        normalized?.brokerTicket || normalized?.broker_ticket || ""
+      ).trim();
+      if (normalizedTicket && blockedTicketsBeforeStart.has(normalizedTicket)) return;
       const challengeStartMs = new Date(
         challengeForBridge?.created_at || challengeForBridge?.updated_at || ""
       ).getTime();
-      const tradeEventMs = resolveTradeEventMs(normalized);
+      const tradeEventMs = resolveTradeEventMs(normalized, oneTradeMarketSettings);
       if (
         Number.isFinite(challengeStartMs) &&
         challengeStartMs > 0 &&
         Number.isFinite(tradeEventMs) &&
         tradeEventMs > 0 &&
         tradeEventMs < challengeStartMs
+      ) {
+        return;
+      }
+      if (
+        Number.isFinite(importCutoffMs) &&
+        importCutoffMs > 0 &&
+        Number.isFinite(tradeEventMs) &&
+        tradeEventMs > 0 &&
+        tradeEventMs < importCutoffMs
       ) {
         return;
       }
@@ -5199,6 +5236,111 @@ export default function GoldJournal({ session: supabaseSession = null }) {
         : [],
     [focusCurrentDisciplineChallenge, focusDisciplineEvaluation]
   );
+  useEffect(() => {
+    if (!focusCurrentDisciplineChallenge) {
+      if (focusSelectedDayKey) setFocusSelectedDayKey("");
+      return;
+    }
+    const checklistKeys = focusDisciplineChecklist
+      .map((item) => String(item?.tradingDayKey || "").slice(0, 10))
+      .filter(Boolean);
+    if (checklistKeys.length === 0) {
+      if (focusSelectedDayKey) setFocusSelectedDayKey("");
+      return;
+    }
+    if (focusSelectedDayKey && checklistKeys.includes(focusSelectedDayKey)) return;
+    const preferredKey = checklistKeys.includes(focusActiveTradingDayKey)
+      ? focusActiveTradingDayKey
+      : checklistKeys[0];
+    if (preferredKey && preferredKey !== focusSelectedDayKey) {
+      setFocusSelectedDayKey(preferredKey);
+    }
+  }, [
+    focusCurrentDisciplineChallenge?.id,
+    focusDisciplineChecklist,
+    focusActiveTradingDayKey,
+    focusSelectedDayKey,
+  ]);
+  const focusSelectedDayStatusLabel = (status) => {
+    const normalized = String(status || "").toUpperCase();
+    if (normalized === DISCIPLINE_DAY_STATUS.CLEAN) return "Clean Trade Day";
+    if (normalized === DISCIPLINE_DAY_STATUS.NO_TRADE) return "No Trade Day";
+    if (normalized === DISCIPLINE_DAY_STATUS.BROKEN) return "Broken Day";
+    if (normalized === DISCIPLINE_DAY_STATUS.NEEDS_REVIEW) return "Needs Review";
+    if (
+      normalized === DISCIPLINE_DAY_STATUS.PENDING_CLEAN ||
+      normalized === DISCIPLINE_DAY_STATUS.TRADE_TAKEN ||
+      normalized === DISCIPLINE_DAY_STATUS.MARKET_CLOSED
+    ) {
+      return "Pending";
+    }
+    return "Waiting";
+  };
+  const focusSelectedDayDetails = useMemo(() => {
+    if (!focusCurrentDisciplineChallenge || !focusSelectedDayKey) return null;
+    const allChallengeDays = Array.isArray(focusDisciplineEvaluation?.allChallengeDays)
+      ? focusDisciplineEvaluation.allChallengeDays
+      : [];
+    const dayRecord =
+      allChallengeDays.find(
+        (day) =>
+          String(day?.challenge_id || "") === String(focusCurrentDisciplineChallenge.id) &&
+          String(day?.trading_day_key || day?.trade_date || "").slice(0, 10) === focusSelectedDayKey
+      ) || null;
+    const status = String(dayRecord?.status || "").toUpperCase();
+    const label = focusSelectedDayStatusLabel(status);
+    const reason = String(
+      dayRecord?.broken_rule_reason ||
+        dayRecord?.brokenRuleReason ||
+        dayRecord?.break_reason ||
+        ""
+    ).trim();
+    return {
+      tradingDayKey: focusSelectedDayKey,
+      status,
+      label,
+      brokenReason: reason,
+    };
+  }, [focusCurrentDisciplineChallenge, focusDisciplineEvaluation, focusSelectedDayKey]);
+  const focusSelectedDayTrades = useMemo(() => {
+    if (!focusCurrentDisciplineChallenge || !focusSelectedDayKey) return [];
+    const all = Array.isArray(focusDisciplineEvaluation?.project?.disciplineJournalTrades)
+      ? focusDisciplineEvaluation.project.disciplineJournalTrades
+      : [];
+    const challengeStartMs = (() => {
+      const raw = String(
+        focusCurrentDisciplineChallenge?.created_at ||
+          focusCurrentDisciplineChallenge?.updated_at ||
+          ""
+      ).trim();
+      if (!raw) return null;
+      const parsed = new Date(raw);
+      return Number.isNaN(parsed.getTime()) ? null : parsed.getTime();
+    })();
+    const dayTrades = all.filter((trade) => {
+      if (String(trade?.discipline_challenge_id || "") !== String(focusCurrentDisciplineChallenge.id)) {
+        return false;
+      }
+      const tradeDayKey = getOneTradeViewDayKey(
+        trade,
+        focusMarketSettings,
+        focusSelectedDayKey,
+        localDateValue(nowDate)
+      );
+      if (!tradeDayKey || tradeDayKey !== focusSelectedDayKey) return false;
+      if (!isMt5ImportedTrade(trade)) return false;
+      if (!Number.isFinite(challengeStartMs) || challengeStartMs <= 0) return true;
+      const tradeEventMs = resolveTradeEventMs(trade, focusMarketSettings);
+      if (!Number.isFinite(tradeEventMs) || tradeEventMs <= 0) return true;
+      return tradeEventMs >= challengeStartMs;
+    });
+    return dayTrades.sort(compareTradesChronoDesc);
+  }, [
+    focusCurrentDisciplineChallenge,
+    focusDisciplineEvaluation,
+    focusSelectedDayKey,
+    focusMarketSettings,
+  ]);
   const focusYesterdaySummary = useMemo(() => {
     const currentTradingDayKey = focusActiveTradingDayKey;
     if (!focusCurrentDisciplineChallenge) {
@@ -5291,27 +5433,25 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     const filtered = focusCurrentDisciplineChallenge
           ? all.filter((trade) => {
               if (trade?.discipline_challenge_id !== focusCurrentDisciplineChallenge.id) return false;
-          const tradeDayKey = String(
-            trade?.trading_day_key ||
-              trade?.tradingDayKey ||
-              getTradeTradingDayKey(trade, focusMarketSettings) ||
-              trade?.date ||
-              ""
-          ).slice(0, 10);
+          const tradeDayKey = getOneTradeViewDayKey(
+            trade,
+            focusMarketSettings,
+            activeDayKey,
+            localDateValue(nowDate)
+          );
           if (!tradeDayKey || tradeDayKey !== activeDayKey) return false;
           if (!Number.isFinite(challengeStartMs) || challengeStartMs <= 0) return true;
-          const tradeEventMs = resolveTradeEventMs(trade);
+          const tradeEventMs = resolveTradeEventMs(trade, focusMarketSettings);
           if (!Number.isFinite(tradeEventMs) || tradeEventMs <= 0) return true;
           return tradeEventMs >= challengeStartMs;
         })
       : all.filter((trade) => {
-          const tradeDayKey = String(
-            trade?.trading_day_key ||
-              trade?.tradingDayKey ||
-              getTradeTradingDayKey(trade, focusMarketSettings) ||
-              trade?.date ||
-              ""
-          ).slice(0, 10);
+          const tradeDayKey = getOneTradeViewDayKey(
+            trade,
+            focusMarketSettings,
+            activeDayKey,
+            localDateValue(nowDate)
+          );
           return Boolean(trade?.one_trade_manual) && tradeDayKey === activeDayKey;
         });
     return filtered.sort(compareTradesChronoDesc);
@@ -5338,7 +5478,12 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     const sortedAsc = [...focusRuleJournalTrades].sort(compareTradesChronoAsc);
     const idsByDay = {};
     sortedAsc.forEach((trade) => {
-      const dayKey = String(trade?.trading_day_key || trade?.date || "");
+      const dayKey = getOneTradeViewDayKey(
+        trade,
+        focusMarketSettings,
+        focusActiveTradingDayKey,
+        localDateValue(nowDate)
+      );
       if (!dayKey) return;
       if (!idsByDay[dayKey]) idsByDay[dayKey] = [];
       idsByDay[dayKey].push(trade.id);
@@ -5355,7 +5500,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       });
     });
     return meta;
-  }, [focusRuleJournalTrades, focusBrokenDayKeySet]);
+  }, [focusRuleJournalTrades, focusBrokenDayKeySet, focusMarketSettings, focusActiveTradingDayKey, nowDate]);
   const focusVisibleRuleJournalTrades = useMemo(() => {
     if (!showBrokenOnlyTrades) return focusRuleJournalTrades;
     return focusRuleJournalTrades.filter((trade) => Boolean(focusBrokenMetaByTradeId[trade.id]?.brokenDay));
@@ -6490,11 +6635,41 @@ export default function GoldJournal({ session: supabaseSession = null }) {
 
   const startDisciplineChallengeForUser = async (targetCleanDays, challengeName) => {
     const safeName = String(challengeName || "").trim();
-    const startedRuleState = applyOneTradeRule(
+    const mt5TicketSnapshot = Array.from(
+      new Set(
+        (Array.isArray(projects)
+          ? projects.flatMap((project) => (Array.isArray(project?.trades) ? project.trades : []))
+          : []
+        )
+          .filter((trade) => isMt5ImportedTrade(trade))
+          .map((trade) => String(trade?.brokerTicket || trade?.broker_ticket || "").trim())
+          .filter(Boolean)
+      )
+    );
+    const challengeStartIso = nowDate.toISOString();
+
+    const startedRuleStateBase = applyOneTradeRule(
       startDisciplineChallenge(oneTradeRule, {
         targetCleanDays,
         challengeName: safeName,
       }),
+      nowDate
+    );
+    const startedRuleState = applyOneTradeRule(
+      {
+        ...startedRuleStateBase,
+        disciplineChallenges: Array.isArray(startedRuleStateBase?.disciplineChallenges)
+          ? startedRuleStateBase.disciplineChallenges.map((challenge) =>
+              challenge?.status === DISCIPLINE_CHALLENGE_STATUS.ACTIVE
+                ? {
+                    ...challenge,
+                    trade_import_cutoff_at: challengeStartIso,
+                    blocked_mt5_tickets_before_start: mt5TicketSnapshot,
+                  }
+                : challenge
+            )
+          : [],
+      },
       nowDate
     );
     setOneTradeRule(startedRuleState);
@@ -11381,6 +11556,9 @@ export default function GoldJournal({ session: supabaseSession = null }) {
                               const isNoTrade = item.state === "NO_TRADE";
                               const isNeedsReview = item.state === "NEEDS_REVIEW";
                               const isPending = item.state === "PENDING";
+                              const isSelectedDay =
+                                Boolean(focusSelectedDayKey) &&
+                                String(item?.tradingDayKey || "").slice(0, 10) === focusSelectedDayKey;
                               const cardBackground = isBroken
                                 ? "#FEF2F2"
                                 : isClean
@@ -11440,6 +11618,9 @@ export default function GoldJournal({ session: supabaseSession = null }) {
                                 <div
                                   key={item.day}
                                   title={`${item.tradingDayKey || ""} - ${item.label}`}
+                                  onClick={() =>
+                                    setFocusSelectedDayKey(String(item?.tradingDayKey || "").slice(0, 10))
+                                  }
                                   style={{
                                     background: cardBackground,
                                     border: `1px solid ${cardBorder}`,
@@ -11448,6 +11629,9 @@ export default function GoldJournal({ session: supabaseSession = null }) {
                                     minWidth: usePremiumOneTradeTheme ? 0 : 82,
                                     width: usePremiumOneTradeTheme ? "auto" : "fit-content",
                                     boxShadow: usePremiumOneTradeTheme ? "0 4px 14px rgba(15, 23, 42, 0.04)" : "none",
+                                    cursor: "pointer",
+                                    outline: isSelectedDay ? "2px solid #93C5FD" : "none",
+                                    outlineOffset: isSelectedDay ? 1 : 0,
                                   }}
                                 >
                                   {usePremiumOneTradeTheme ? (
@@ -11569,6 +11753,9 @@ export default function GoldJournal({ session: supabaseSession = null }) {
                                 <div
                                   key={item.tradingDayKey}
                                   title={`${item.tradingDayKey} - ${item.label}`}
+                                  onClick={() =>
+                                    setFocusSelectedDayKey(String(item?.tradingDayKey || "").slice(0, 10))
+                                  }
                                   style={{
                                     display: "inline-flex",
                                     alignItems: "center",
@@ -11579,6 +11766,13 @@ export default function GoldJournal({ session: supabaseSession = null }) {
                                     fontWeight: 500,
                                     lineHeight: 1.2,
                                     flex: "0 0 auto",
+                                    cursor: "pointer",
+                                    padding: "2px 4px",
+                                    borderRadius: 8,
+                                    background:
+                                      String(item?.tradingDayKey || "").slice(0, 10) === focusSelectedDayKey
+                                        ? "#EFF6FF"
+                                        : "transparent",
                                   }}
                                 >
                                   <span>{item.symbol}</span>
@@ -11640,7 +11834,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
                                 <ChartNoAxesColumnIncreasing style={{ width: 22, height: 22, strokeWidth: 2.6 }} />
                               </div>
                             ) : null}
-                            <span>Today's Trade</span>
+                            <span>Today's Trade (Live)</span>
                           </div>
                           <div className="one-trade-controls-row" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                             <FSelect
@@ -11703,6 +11897,17 @@ export default function GoldJournal({ session: supabaseSession = null }) {
                               {showBrokenOnlyTrades ? "Broken Only: On" : "Broken Only: Off"}
                             </button>
                           </div>
+                        </div>
+                        <div
+                          style={{
+                            marginTop: -2,
+                            marginBottom: 10,
+                            fontSize: 12,
+                            color: G.textMuted,
+                            fontWeight: 500,
+                          }}
+                        >
+                          Live trades for the current open trading day.
                         </div>
                         {focusHasImportedReadinessBreachTrade ? (
                           <div
@@ -11785,6 +11990,85 @@ export default function GoldJournal({ session: supabaseSession = null }) {
                           </div>
                         )}
                       </div>
+
+                      {focusCurrentDisciplineChallenge && focusSelectedDayDetails ? (
+                        <div style={{ marginTop: usePremiumOneTradeTheme ? 20 : 14 }}>
+                          <div
+                            style={{
+                              display: "flex",
+                              justifyContent: "space-between",
+                              alignItems: "center",
+                              gap: 8,
+                              flexWrap: "wrap",
+                              marginBottom: 10,
+                            }}
+                          >
+                            <div
+                              style={{
+                                fontFamily: ONE_TRADE_UI_FONT_STACK,
+                                fontSize: usePremiumOneTradeTheme ? 18 : 15,
+                                fontWeight: 700,
+                                color: G.text,
+                              }}
+                            >
+                              Day Details
+                            </div>
+                            <div style={{ fontSize: 12, color: G.textMuted, fontWeight: 600 }}>
+                              {formatShortDateLabel(focusSelectedDayDetails.tradingDayKey)}
+                            </div>
+                          </div>
+                          <div
+                            style={{
+                              background: usePremiumOneTradeTheme ? "#F9FBFF" : G.bgCard2,
+                              border: usePremiumOneTradeTheme ? "1px solid #DDE7F2" : `1px solid ${G.border}`,
+                              borderRadius: usePremiumOneTradeTheme ? 14 : 8,
+                              padding: usePremiumOneTradeTheme ? "14px 16px" : "10px 12px",
+                            }}
+                          >
+                            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                              <span style={{ fontSize: 12, color: G.textMuted, fontWeight: 700 }}>Status:</span>
+                              <span
+                                style={{
+                                  borderRadius: 999,
+                                  border: "1px solid #DDE7F2",
+                                  background: "#FFFFFF",
+                                  color: G.textSub,
+                                  padding: "4px 10px",
+                                  fontSize: 12,
+                                  fontWeight: 700,
+                                }}
+                              >
+                                {focusSelectedDayDetails.label}
+                              </span>
+                            </div>
+                            {focusSelectedDayDetails.brokenReason ? (
+                              <div style={{ marginTop: 8, fontSize: 12, color: G.loss, fontWeight: 600 }}>
+                                Broken rule reason: {focusSelectedDayDetails.brokenReason}
+                              </div>
+                            ) : null}
+                            <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+                              {focusSelectedDayTrades.length === 0 ? (
+                                <div style={{ fontSize: 13, color: G.textMuted }}>
+                                  No MT5 trades saved for this day.
+                                </div>
+                              ) : (
+                                focusSelectedDayTrades.map((trade) => (
+                                  <TradeCard
+                                    key={`day-detail-${trade.id}`}
+                                    trade={trade}
+                                    tradeNo={focusRuleTradeNumberById[trade.id]}
+                                    onClick={() => {}}
+                                    uiFontFamily={ONE_TRADE_UI_FONT_STACK}
+                                    compactTypography
+                                    premiumCard={usePremiumOneTradeTheme}
+                                    deEmphasizePnl={usePremiumOneTradeTheme}
+                                  />
+                                ))
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      ) : null}
 
                       <div style={{ marginTop: usePremiumOneTradeTheme ? 24 : 14 }}>
                         <button

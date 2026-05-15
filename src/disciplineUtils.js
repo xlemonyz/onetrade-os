@@ -546,7 +546,11 @@ function getChallengeStartTimestampMs(challenge) {
   return parsed.getTime();
 }
 
-function getTradeEventTimestampMsForChallenge(trade, settings) {
+export function getTradeEventTimestampMsForChallenge(trade, settings) {
+  const brokerStamp = getTradeTimestamp(trade, settings);
+  if (brokerStamp && !Number.isNaN(brokerStamp.getTime())) {
+    return brokerStamp.getTime();
+  }
   const importedRaw = String(trade?.importedAt || trade?.imported_at || "").trim();
   if (!importedRaw) return null;
   const importedStamp = new Date(importedRaw);
