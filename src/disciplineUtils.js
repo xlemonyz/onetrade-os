@@ -547,15 +547,16 @@ function getChallengeStartTimestampMs(challenge) {
 }
 
 export function getTradeEventTimestampMsForChallenge(trade, settings) {
+  const importedRaw = String(trade?.importedAt || trade?.imported_at || "").trim();
+  if (importedRaw) {
+    const importedStamp = new Date(importedRaw);
+    if (!Number.isNaN(importedStamp.getTime())) return importedStamp.getTime();
+  }
   const brokerStamp = getTradeTimestamp(trade, settings);
   if (brokerStamp && !Number.isNaN(brokerStamp.getTime())) {
     return brokerStamp.getTime();
   }
-  const importedRaw = String(trade?.importedAt || trade?.imported_at || "").trim();
-  if (!importedRaw) return null;
-  const importedStamp = new Date(importedRaw);
-  if (Number.isNaN(importedStamp.getTime())) return null;
-  return importedStamp.getTime();
+  return null;
 }
 
 export function getGoldTradingDay(value = new Date(), settingsInput = {}) {
@@ -800,8 +801,15 @@ function buildRecentDays(days = [], length = 7, options = {}) {
     startKey && sortedKeys.length === 0
       ? Array.from({ length: safeLength }, (_, index) => shiftDateKey(startKey, index))
       : sortedKeys.slice(Math.max(0, sortedKeys.length - safeLength));
+  const currentTradingDayKey = asDateValue(
+    options.currentTradingDayKey || options.current_trading_day_key
+  );
   return keys.map((key) => {
-    const status = byKey.get(key);
+    const rawStatus = byKey.get(key);
+    const status =
+      currentTradingDayKey && key > currentTradingDayKey
+        ? DISCIPLINE_DAY_STATUS.WAITING
+        : rawStatus;
     let symbol = "•";
     let label = "Waiting";
     if (status === DISCIPLINE_DAY_STATUS.CLEAN) {
@@ -985,6 +993,7 @@ export function evaluateDisciplineState(project, options = {}) {
       allChallengeDays: currentDays,
       recentDays: buildRecentDays(currentDays, 7, {
         startDate: currentChallenge?.start_date || nowTradingDay.tradingDayKey,
+        currentTradingDayKey: nowTradingDay.tradingDayKey,
       }),
       bestStreakCurrentTarget,
     };
@@ -1335,7 +1344,10 @@ export function evaluateDisciplineState(project, options = {}) {
     recentDays: buildRecentDays(
       mergedDays.filter((day) => day.challenge_id === nextActiveChallenge.id),
       7,
-      { startDate: nextActiveChallenge.start_date || nowTradingDay.tradingDayKey }
+      {
+        startDate: nextActiveChallenge.start_date || nowTradingDay.tradingDayKey,
+        currentTradingDayKey: nowTradingDay.tradingDayKey,
+      }
     ),
     bestStreakCurrentTarget,
     transitionsChanged,
@@ -1712,9 +1724,12 @@ export function getDisciplineDashboardMessage(summary) {
   return "Today's winner is the trader who follows the rule.";
 }
 
-export function getChallengeChecklist(activeChallenge, allChallengeDays = []) {
+export function getChallengeChecklist(activeChallenge, allChallengeDays = [], options = {}) {
   const target = Math.max(1, asNumber(activeChallenge?.target_clean_days, 0));
   const start = asDateValue(activeChallenge?.start_date) || localDateValue();
+  const currentTradingDayKey = asDateValue(
+    options.currentTradingDayKey || options.current_trading_day_key
+  );
   const sequenceDays = Array.isArray(allChallengeDays)
     ? [...allChallengeDays]
         .filter((day) => {
@@ -1754,7 +1769,11 @@ export function getChallengeChecklist(activeChallenge, allChallengeDays = []) {
     const isAfterBrokenBoundary =
       Boolean(normalizedFirstBrokenKey) && key > normalizedFirstBrokenKey;
     const day = isAfterBrokenBoundary ? null : dayByKey.get(key) || null;
-    const status = normalizeDayStatus(day?.status);
+    const rawStatus = normalizeDayStatus(day?.status);
+    const status =
+      currentTradingDayKey && key > currentTradingDayKey
+        ? DISCIPLINE_DAY_STATUS.WAITING
+        : rawStatus;
     let state = "WAITING";
     if (status === DISCIPLINE_DAY_STATUS.CLEAN) state = "CLEAN";
     else if (status === DISCIPLINE_DAY_STATUS.NO_TRADE) state = "NO_TRADE";

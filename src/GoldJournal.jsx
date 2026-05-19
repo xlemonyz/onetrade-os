@@ -2028,9 +2028,6 @@ function normalizeOneTradeOutcome(outcome) {
 }
 
 function resolveMt5TradeDayKey(trade, marketSettings, currentGoldDayKey = "", fallbackLocalDate = "") {
-  const computedKey = String(getTradeTradingDayKey(trade, marketSettings) || "").slice(0, 10);
-  if (computedKey) return computedKey;
-
   const explicitKey = String(trade?.trading_day_key || trade?.tradingDayKey || "").slice(0, 10);
   if (explicitKey) return explicitKey;
 
@@ -2047,10 +2044,24 @@ function resolveMt5TradeDayKey(trade, marketSettings, currentGoldDayKey = "", fa
     }
   }
 
+  const computedKey = String(getTradeTradingDayKey(trade, marketSettings) || "").slice(0, 10);
+  if (computedKey) return computedKey;
+
   const rawDateKey = String(trade?.date || "").slice(0, 10);
   if (rawDateKey) return rawDateKey;
 
   return currentGoldDayKey || fallbackLocalDate || "";
+}
+
+function getDateKeyDiffInDays(a, b) {
+  const left = String(a || "").slice(0, 10);
+  const right = String(b || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(left) || !/^\d{4}-\d{2}-\d{2}$/.test(right)) {
+    return null;
+  }
+  const leftMs = Date.UTC(Number(left.slice(0, 4)), Number(left.slice(5, 7)) - 1, Number(left.slice(8, 10)));
+  const rightMs = Date.UTC(Number(right.slice(0, 4)), Number(right.slice(5, 7)) - 1, Number(right.slice(8, 10)));
+  return Math.round((leftMs - rightMs) / 86400000);
 }
 
 function resolveTradeEventMs(trade, marketSettings) {
@@ -3444,6 +3455,14 @@ function TradeCard({
   const isLoss = trade.outcome === "SL";
   const isImported = isMt5ImportedTrade(trade);
   const sourceLabel = formatTradeSource(trade);
+  const canonicalDayKey = String(trade?.trading_day_key || trade?.tradingDayKey || "").slice(0, 10);
+  const brokerDateKey = String(
+    trade?.broker_trade_date ||
+      trade?.brokerTradeDate ||
+      (isImported && canonicalDayKey && String(trade?.date || "").slice(0, 10) !== canonicalDayKey
+        ? trade?.date
+        : "")
+  ).slice(0, 10);
   const entry = Number(trade.entryPrice);
   const exit = Number(getOutcomePrice(trade));
   const directionMultiplier = trade.direction === "SELL" ? -1 : 1;
@@ -3552,9 +3571,22 @@ function TradeCard({
           <span style={{ fontSize: compactTypography ? 14 : 11, color: G.textMuted, fontWeight: compactTypography ? 500 : 400 }}>
             Source: {sourceLabel}
           </span>
-          <span style={{ fontSize: compactTypography ? 14 : 11, color: G.textMuted, fontWeight: compactTypography ? 500 : 400 }}>
-            {trade.date}
-          </span>
+          {disciplineMode && canonicalDayKey ? (
+            <>
+              <span style={{ fontSize: compactTypography ? 14 : 11, color: G.textMuted, fontWeight: compactTypography ? 500 : 400 }}>
+                Gold Day: {formatShortDateLabel(canonicalDayKey)}
+              </span>
+              {brokerDateKey ? (
+                <span style={{ fontSize: compactTypography ? 13 : 11, color: G.textMuted, fontWeight: 400, opacity: 0.78 }}>
+                  MT5 broker date: {brokerDateKey}
+                </span>
+              ) : null}
+            </>
+          ) : (
+            <span style={{ fontSize: compactTypography ? 14 : 11, color: G.textMuted, fontWeight: compactTypography ? 500 : 400 }}>
+              {trade.date}
+            </span>
+          )}
         </div>
         <div
           role={canToggleAmount ? "button" : undefined}
@@ -4689,29 +4721,32 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       });
     });
 
-    const dedupeKeys = new Set(
-      normalizedStored.map((trade) => getOneTradeDuplicateKey(trade)).filter(Boolean)
+    return normalizedStored;
+  }
+
+  function attachMt5TradesToActiveChallenge(sourceRule = oneTradeRule, sourceProjects = projects) {
+    const baseRule = normalizeOneTradeRule(
+      sourceRule,
+      supabaseSession?.user?.id || sourceRule?.user_id || ""
     );
+    const oneTradeMarketSettings = normalizeDisciplineMarketSettings(
+      baseRule?.disciplineMarketSettings || {},
+      baseRule?.id || ""
+    );
+    const currentGoldDayKey = getCountdownToGoldClose(nowDate, oneTradeMarketSettings)?.tradingDayKey || "";
     const activeChallenge = getActiveDisciplineChallenge(sourceRule);
-    const allChallenges = Array.isArray(sourceRule?.disciplineChallenges)
-      ? sourceRule.disciplineChallenges
+    if (!activeChallenge?.id) return { rule: baseRule, changed: false, attachedCount: 0 };
+
+    const existing = Array.isArray(baseRule?.disciplineManualJournalTrades)
+      ? baseRule.disciplineManualJournalTrades.map(normalizeTrade)
       : [];
-    const fallbackCurrentChallenge =
-      [...allChallenges]
-        .filter(
-          (challenge) =>
-            challenge?.status === DISCIPLINE_CHALLENGE_STATUS.BROKEN_FROZEN ||
-            challenge?.status === DISCIPLINE_CHALLENGE_STATUS.SCHEDULED
-        )
-        .sort((a, b) => String(b?.updated_at || "").localeCompare(String(a?.updated_at || "")))[0] ||
-      [...allChallenges]
-        .filter((challenge) => challenge?.status !== DISCIPLINE_CHALLENGE_STATUS.ARCHIVED)
-        .sort((a, b) => String(b?.updated_at || "").localeCompare(String(a?.updated_at || "")))[0] ||
-      null;
-    const challengeForBridge = activeChallenge || fallbackCurrentChallenge;
-    if (!challengeForBridge) {
-      return normalizedStored;
-    }
+    const dedupeKeys = new Set(existing.map((trade) => getOneTradeDuplicateKey(trade)).filter(Boolean));
+    const existingIndexByKey = new Map();
+    existing.forEach((trade, index) => {
+      const key = getOneTradeDuplicateKey(trade);
+      if (key) existingIndexByKey.set(key, index);
+    });
+    const challengeForBridge = activeChallenge;
     const blockedTicketsBeforeStart = new Set(
       (Array.isArray(challengeForBridge?.blocked_mt5_tickets_before_start)
         ? challengeForBridge.blocked_mt5_tickets_before_start
@@ -4722,10 +4757,15 @@ export default function GoldJournal({ session: supabaseSession = null }) {
     );
     const importCutoffRaw = String(challengeForBridge?.trade_import_cutoff_at || "").trim();
     const importCutoffMs = importCutoffRaw ? new Date(importCutoffRaw).getTime() : null;
+    const challengeStartMs = new Date(
+      challengeForBridge?.created_at || challengeForBridge?.updated_at || ""
+    ).getTime();
 
-    const bridgedImportedTrades = [];
-    const projectTrades = Array.isArray(projects)
-      ? projects.flatMap((project) =>
+    const attachedTrades = [];
+    let updatedExistingCount = 0;
+    const nextExisting = [...existing];
+    const projectTrades = Array.isArray(sourceProjects)
+      ? sourceProjects.flatMap((project) =>
           Array.isArray(project?.trades) ? project.trades : []
         )
       : [];
@@ -4736,9 +4776,6 @@ export default function GoldJournal({ session: supabaseSession = null }) {
         normalized?.brokerTicket || normalized?.broker_ticket || ""
       ).trim();
       if (normalizedTicket && blockedTicketsBeforeStart.has(normalizedTicket)) return;
-      const challengeStartMs = new Date(
-        challengeForBridge?.created_at || challengeForBridge?.updated_at || ""
-      ).getTime();
       const tradeEventMs = resolveTradeEventMs(normalized, oneTradeMarketSettings);
       if (
         Number.isFinite(challengeStartMs) &&
@@ -4758,6 +4795,7 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       ) {
         return;
       }
+      const brokerTradeDateKey = String(normalized?.date || "").slice(0, 10);
       const normalizedOutcome = normalizeOneTradeOutcome(normalized?.outcome) || "Manual";
       const rawTradeDayKey = resolveMt5TradeDayKey(
         normalized,
@@ -4765,9 +4803,10 @@ export default function GoldJournal({ session: supabaseSession = null }) {
         currentGoldDayKey,
         todayLocalDate
       );
-      const tradeDateKey = String(normalized?.date || "").slice(0, 10);
-      const tradingDayKey = rawTradeDayKey || tradeDateKey || currentGoldDayKey;
+      const tradingDayKey = rawTradeDayKey || brokerTradeDateKey || currentGoldDayKey;
       if (!tradingDayKey) return;
+      const brokerDayDrift = getDateKeyDiffInDays(tradingDayKey, brokerTradeDateKey);
+      if (brokerDayDrift !== null && Math.abs(brokerDayDrift) > 1) return;
       const challengeStartDate = String(challengeForBridge?.start_date || "").slice(0, 10);
       if (challengeStartDate && tradingDayKey < challengeStartDate) return;
 
@@ -4776,6 +4815,8 @@ export default function GoldJournal({ session: supabaseSession = null }) {
         ...normalized,
         one_trade_manual: false,
         outcome: normalizedOutcome,
+        broker_trade_date: brokerTradeDateKey,
+        broker_trade_time: String(normalized?.time || "").trim(),
         trading_day_key: tradingDayKey,
         discipline_journal_name: normalized?.discipline_journal_name || "Trades Journal",
         discipline_challenge_id: String(challengeForBridge.id),
@@ -4787,12 +4828,45 @@ export default function GoldJournal({ session: supabaseSession = null }) {
             READINESS_STATUS.DO_NOT_TRADE,
       });
       const key = getOneTradeDuplicateKey(bridgedTrade);
-      if (key && dedupeKeys.has(key)) return;
+      if (key && dedupeKeys.has(key)) {
+        const existingIndex = existingIndexByKey.get(key);
+        const existingTrade = Number.isInteger(existingIndex) ? nextExisting[existingIndex] : null;
+        if (
+          existingTrade &&
+          String(existingTrade?.discipline_challenge_id || "") === String(challengeForBridge.id)
+        ) {
+          const refreshedTrade = normalizeTrade({
+            ...bridgedTrade,
+            id: existingTrade.id || bridgedTrade.id,
+            discipline_challenge_id:
+              existingTrade.discipline_challenge_id || bridgedTrade.discipline_challenge_id,
+            trading_day_key: existingTrade.trading_day_key || bridgedTrade.trading_day_key,
+            broker_trade_date: existingTrade.broker_trade_date || bridgedTrade.broker_trade_date,
+            broker_trade_time: existingTrade.broker_trade_time || bridgedTrade.broker_trade_time,
+          });
+          if (JSON.stringify(refreshedTrade) !== JSON.stringify(existingTrade)) {
+            nextExisting[existingIndex] = refreshedTrade;
+            updatedExistingCount += 1;
+          }
+        }
+        return;
+      }
       if (key) dedupeKeys.add(key);
-      bridgedImportedTrades.push(bridgedTrade);
+      attachedTrades.push(bridgedTrade);
     });
 
-    return [...normalizedStored, ...bridgedImportedTrades];
+    if (attachedTrades.length === 0 && updatedExistingCount === 0) {
+      return { rule: baseRule, changed: false, attachedCount: 0 };
+    }
+
+    return {
+      rule: {
+        ...baseRule,
+        disciplineManualJournalTrades: [...attachedTrades, ...nextExisting],
+      },
+      changed: true,
+      attachedCount: attachedTrades.length,
+    };
   }
 
   function evaluateOneTradeRule(ruleState = oneTradeRule, atNow = nowDate) {
@@ -5033,6 +5107,15 @@ export default function GoldJournal({ session: supabaseSession = null }) {
   }, [loaded, todayLocalDate]);
 
   useEffect(() => {
+    if (!loaded) return;
+    setOneTradeRule((prev) => {
+      const attachment = attachMt5TradesToActiveChallenge(prev, projects);
+      if (!attachment.changed) return prev;
+      return applyOneTradeRule(attachment.rule, nowDate);
+    });
+  }, [loaded, projects, oneTradeRule?.disciplineChallenges]);
+
+  useEffect(() => {
     const timer = setInterval(() => {
       setDisciplineNowMs(Date.now());
     }, 1000);
@@ -5231,10 +5314,11 @@ export default function GoldJournal({ session: supabaseSession = null }) {
       focusCurrentDisciplineChallenge
         ? getChallengeChecklist(
             focusCurrentDisciplineChallenge,
-            focusDisciplineEvaluation?.allChallengeDays || []
+            focusDisciplineEvaluation?.allChallengeDays || [],
+            { currentTradingDayKey: focusActiveTradingDayKey }
           )
         : [],
-    [focusCurrentDisciplineChallenge, focusDisciplineEvaluation]
+    [focusCurrentDisciplineChallenge, focusDisciplineEvaluation, focusActiveTradingDayKey]
   );
   useEffect(() => {
     if (!focusCurrentDisciplineChallenge) {
